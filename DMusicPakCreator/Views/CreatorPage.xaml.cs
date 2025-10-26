@@ -9,6 +9,9 @@ using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI;
 using Microsoft.UI.Xaml.Media;
 using WinRT.Interop;
+using System;
+using System.Linq;
+using System.Threading.Tasks;
 
 namespace DMusicPakCreator.Views;
 
@@ -20,30 +23,58 @@ public sealed partial class CreatorPage : Page
 
     public CreatorPage()
     {
-        // 获取服务
-        var packageService = App.GetService<PackageService>();
-        var audioService = App.GetService<AudioService>();
-        var coverService = App.GetService<CoverService>();
-        var lyricsService = App.GetService<LyricsService>();
-        var mediaPlayerService = App.GetService<MediaPlayerService>();
-
         ViewModel = new CreatorViewModel(
-            packageService,
-            audioService,
-            coverService,
-            lyricsService,
-            mediaPlayerService);
+            App.GetService<PackageService>(),
+            App.GetService<AudioService>(),
+            App.GetService<CoverService>(),
+            App.GetService<LyricsService>(),
+            App.GetService<MediaPlayerService>());
 
         InitializeComponent();
 
-        // 初始化播放定时器
-        _playbackTimer = new DispatcherTimer();
-        _playbackTimer.Interval = TimeSpan.FromMilliseconds(100);
-        _playbackTimer.Tick += PlaybackTimer_Tick;
-
-        // 绑定ViewModel到DataContext
-        DataContext = ViewModel;
+        InitializePlaybackTimer();
+        
+        // 监听ViewModel属性变化
+        ViewModel.PropertyChanged += ViewModel_PropertyChanged;
     }
+
+    private void InitializePlaybackTimer()
+    {
+        _playbackTimer = new DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(100)
+        };
+        _playbackTimer.Tick += (s, e) =>
+        {
+            ViewModel.UpdatePlaybackTime();
+            UpdateLyricsHighlight();
+        };
+    }
+
+    #region Value Converters (用于x:Bind函数绑定)
+    
+    public string GetPlayPauseGlyph(bool isPlaying) => isPlaying ? "\uE769" : "\uE768";
+    
+    public int GetLyricFormatIndex(LyricFormat format) => (int)format;
+    
+    #endregion
+
+    #region ViewModel Event Handlers
+
+    private void ViewModel_PropertyChanged(object sender, System.ComponentModel.PropertyChangedEventArgs e)
+    {
+        switch (e.PropertyName)
+        {
+            case nameof(ViewModel.ParsedLyrics):
+                UpdateLyricsPreview();
+                break;
+            case nameof(ViewModel.CurrentLyricIndex):
+                UpdateLyricsHighlight();
+                break;
+        }
+    }
+
+    #endregion
 
     #region File Operations
 
@@ -54,7 +85,7 @@ public sealed partial class CreatorPage : Page
         try
         {
             ViewModel.CreateNewPackageCommand.Execute(null);
-            ShowInfoBar("新建成功", "已创建新的音乐包，请导入音频文件", InfoBarSeverity.Success);
+            ShowInfoBar("新建成功", "已创建新的音乐包", InfoBarSeverity.Success);
         }
         catch (Exception ex)
         {
@@ -66,11 +97,7 @@ public sealed partial class CreatorPage : Page
     {
         if (!await PromptSaveChanges()) return;
 
-        var picker = new FileOpenPicker();
-        InitializeWithWindow.Initialize(picker, WindowNative.GetWindowHandle(App.MainWindow));
-        picker.FileTypeFilter.Add(".dmusicpak");
-
-        var file = await picker.PickSingleFileAsync();
+        var file = await PickFileAsync(new[] { ".dmusicpak" }, PickerLocationId.DocumentsLibrary);
         if (file != null)
         {
             try
@@ -88,13 +115,9 @@ public sealed partial class CreatorPage : Page
     private async void SavePackage_Click(object sender, RoutedEventArgs e)
     {
         if (string.IsNullOrEmpty(ViewModel.CurrentFilePath))
-        {
             await SavePackageAs();
-        }
         else
-        {
             await SavePackage(ViewModel.CurrentFilePath);
-        }
     }
 
     private async void SavePackageAs_Click(object sender, RoutedEventArgs e)
@@ -104,16 +127,12 @@ public sealed partial class CreatorPage : Page
 
     private async Task SavePackageAs()
     {
-        var picker = new FileSavePicker();
-        InitializeWithWindow.Initialize(picker, WindowNative.GetWindowHandle(App.MainWindow));
-        picker.FileTypeChoices.Add("DMusicPak文件", new[] { ".dmusicpak" });
-        picker.SuggestedFileName = string.IsNullOrEmpty(ViewModel.Title) ? "音乐包" : ViewModel.Title;
-
-        var file = await picker.PickSaveFileAsync();
+        var file = await SaveFileAsync(
+            new[] { (".dmusicpak", new[] { ".dmusicpak" }) },
+            string.IsNullOrEmpty(ViewModel.Title) ? "音乐包" : ViewModel.Title);
+        
         if (file != null)
-        {
             await SavePackage(file.Path);
-        }
     }
 
     private async Task SavePackage(string path)
@@ -121,7 +140,7 @@ public sealed partial class CreatorPage : Page
         try
         {
             ViewModel.SavePackageCommand.Execute(path);
-            ShowInfoBar("保存成功", $"已保存到: {Path.GetFileName(path)}", InfoBarSeverity.Success);
+            ShowInfoBar("保存成功", $"已保存", InfoBarSeverity.Success);
         }
         catch (Exception ex)
         {
@@ -147,14 +166,7 @@ public sealed partial class CreatorPage : Page
         var result = await dialog.ShowAsync();
         if (result == ContentDialogResult.Primary)
         {
-            if (string.IsNullOrEmpty(ViewModel.CurrentFilePath))
-            {
-                await SavePackageAs();
-            }
-            else
-            {
-                await SavePackage(ViewModel.CurrentFilePath);
-            }
+            SavePackage_Click(null, null);
             return true;
         }
 
@@ -167,28 +179,10 @@ public sealed partial class CreatorPage : Page
 
     private async void ImportAudio_Click(object sender, RoutedEventArgs e)
     {
-        var picker = new FileOpenPicker();
-        InitializeWithWindow.Initialize(picker, WindowNative.GetWindowHandle(App.MainWindow));
-
-        picker.FileTypeFilter.Add(".mp3");
-        picker.FileTypeFilter.Add(".flac");
-        picker.FileTypeFilter.Add(".wav");
-        picker.FileTypeFilter.Add(".ogg");
-        picker.FileTypeFilter.Add(".m4a");
-        picker.FileTypeFilter.Add(".aac");
-
-        var file = await picker.PickSingleFileAsync();
+        var file = await PickFileAsync(new[] { ".mp3", ".flac", ".wav", ".ogg", ".m4a", ".aac" }, PickerLocationId.MusicLibrary);
         if (file != null)
         {
-            try
-            {
-                await ViewModel.ImportAudioAsync(file);
-                ShowInfoBar("导入成功", $"已导入音频: {file.Name}", InfoBarSeverity.Success);
-            }
-            catch (Exception ex)
-            {
-                ShowInfoBar("导入失败", ex.Message, InfoBarSeverity.Error);
-            }
+            await ImportAudioFile(file);
         }
     }
 
@@ -206,27 +200,29 @@ public sealed partial class CreatorPage : Page
         if (e.DataView.Contains(StandardDataFormats.StorageItems))
         {
             var items = await e.DataView.GetStorageItemsAsync();
-            if (items.Count > 0 && items[0] is StorageFile file)
+            var file = items.OfType<StorageFile>().FirstOrDefault();
+            
+            if (file != null && IsAudioFile(file.FileType))
             {
-                string ext = file.FileType.ToLower();
-                if (ext == ".mp3" || ext == ".flac" || ext == ".wav" ||
-                    ext == ".ogg" || ext == ".m4a" || ext == ".aac")
-                {
-                    try
-                    {
-                        await ViewModel.ImportAudioAsync(file);
-                        ShowInfoBar("导入成功", $"已导入音频: {file.Name}", InfoBarSeverity.Success);
-                    }
-                    catch (Exception ex)
-                    {
-                        ShowInfoBar("导入失败", ex.Message, InfoBarSeverity.Error);
-                    }
-                }
-                else
-                {
-                    ShowInfoBar("格式错误", "请拖拽音频文件", InfoBarSeverity.Warning);
-                }
+                await ImportAudioFile(file);
             }
+            else
+            {
+                ShowInfoBar("格式错误", "请拖拽支持的音频文件", InfoBarSeverity.Warning);
+            }
+        }
+    }
+
+    private async Task ImportAudioFile(StorageFile file)
+    {
+        try
+        {
+            await ViewModel.ImportAudioAsync(file);
+            ShowInfoBar("导入成功", $"已导入: {file.Name}", InfoBarSeverity.Success);
+        }
+        catch (Exception ex)
+        {
+            ShowInfoBar("导入失败", ex.Message, InfoBarSeverity.Error);
         }
     }
 
@@ -236,27 +232,10 @@ public sealed partial class CreatorPage : Page
 
     private async void ImportCover_Click(object sender, RoutedEventArgs e)
     {
-        var picker = new FileOpenPicker();
-        InitializeWithWindow.Initialize(picker, WindowNative.GetWindowHandle(App.MainWindow));
-
-        picker.FileTypeFilter.Add(".jpg");
-        picker.FileTypeFilter.Add(".jpeg");
-        picker.FileTypeFilter.Add(".png");
-        picker.FileTypeFilter.Add(".bmp");
-        picker.FileTypeFilter.Add(".webp");
-
-        var file = await picker.PickSingleFileAsync();
+        var file = await PickFileAsync(new[] { ".jpg", ".jpeg", ".png", ".bmp", ".webp" }, PickerLocationId.PicturesLibrary);
         if (file != null)
         {
-            try
-            {
-                await ViewModel.ImportCoverAsync(file);
-                ShowInfoBar("导入成功", "已导入封面图片", InfoBarSeverity.Success);
-            }
-            catch (Exception ex)
-            {
-                ShowInfoBar("导入失败", ex.Message, InfoBarSeverity.Error);
-            }
+            await ImportCoverFile(file);
         }
     }
 
@@ -274,34 +253,36 @@ public sealed partial class CreatorPage : Page
         if (e.DataView.Contains(StandardDataFormats.StorageItems))
         {
             var items = await e.DataView.GetStorageItemsAsync();
-            if (items.Count > 0 && items[0] is StorageFile file)
+            var file = items.OfType<StorageFile>().FirstOrDefault();
+            
+            if (file != null && IsImageFile(file.FileType))
             {
-                string ext = file.FileType.ToLower();
-                if (ext == ".jpg" || ext == ".jpeg" || ext == ".png" ||
-                    ext == ".bmp" || ext == ".webp")
-                {
-                    try
-                    {
-                        await ViewModel.ImportCoverAsync(file);
-                        ShowInfoBar("导入成功", "已导入封面图片", InfoBarSeverity.Success);
-                    }
-                    catch (Exception ex)
-                    {
-                        ShowInfoBar("导入失败", ex.Message, InfoBarSeverity.Error);
-                    }
-                }
-                else
-                {
-                    ShowInfoBar("格式错误", "请拖拽图片文件", InfoBarSeverity.Warning);
-                }
+                await ImportCoverFile(file);
             }
+            else
+            {
+                ShowInfoBar("格式错误", "请拖拽支持的图片文件", InfoBarSeverity.Warning);
+            }
+        }
+    }
+
+    private async Task ImportCoverFile(StorageFile file)
+    {
+        try
+        {
+            await ViewModel.ImportCoverAsync(file);
+            ShowInfoBar("导入成功", "已导入封面", InfoBarSeverity.Success);
+        }
+        catch (Exception ex)
+        {
+            ShowInfoBar("导入失败", ex.Message, InfoBarSeverity.Error);
         }
     }
 
     private void RemoveCover_Click(object sender, RoutedEventArgs e)
     {
         ViewModel.RemoveCoverCommand.Execute(null);
-        ShowInfoBar("已移除", "已移除封面图片", InfoBarSeverity.Informational);
+        ShowInfoBar("已移除", "已移除封面", InfoBarSeverity.Informational);
     }
 
     #endregion
@@ -310,28 +291,24 @@ public sealed partial class CreatorPage : Page
 
     private async void ImportLyrics_Click(object sender, RoutedEventArgs e)
     {
-        var picker = new FileOpenPicker();
-        InitializeWithWindow.Initialize(picker, WindowNative.GetWindowHandle(App.MainWindow));
-
-        picker.FileTypeFilter.Add(".lrc");
-        picker.FileTypeFilter.Add(".srt");
-        picker.FileTypeFilter.Add(".ass");
-
-        var file = await picker.PickSingleFileAsync();
+        var file = await PickFileAsync(new[] { ".lrc", ".srt", ".ass" }, PickerLocationId.MusicLibrary);
         if (file != null)
         {
             try
             {
                 string content = await FileIO.ReadTextAsync(file);
-                LyricsBox.Text = content;
+                ViewModel.LyricsText = content;
 
                 // 自动识别格式
-                string ext = file.FileType.ToLower();
-                if (ext == ".lrc") LyricsFormatCombo.SelectedIndex = 3;
-                else if (ext == ".srt") LyricsFormatCombo.SelectedIndex = 4;
-                else if (ext == ".ass") LyricsFormatCombo.SelectedIndex = 5;
+                ViewModel.LyricsFormat = file.FileType.ToLower() switch
+                {
+                    ".lrc" => LyricFormat.LrcLineByLine,
+                    ".srt" => LyricFormat.SRT,
+                    ".ass" => LyricFormat.ASS,
+                    _ => LyricFormat.None
+                };
 
-                ShowInfoBar("导入成功", $"已导入歌词: {file.Name}", InfoBarSeverity.Success);
+                ShowInfoBar("导入成功", $"已导入: {file.Name}", InfoBarSeverity.Success);
             }
             catch (Exception ex)
             {
@@ -347,39 +324,72 @@ public sealed partial class CreatorPage : Page
 
     private void LyricsFormatCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
-        if (ViewModel != null)
+        if (sender is ComboBox combo && ViewModel != null)
         {
-            ViewModel.LyricsFormat = (LyricFormat)LyricsFormatCombo.SelectedIndex;
+            ViewModel.LyricsFormat = (LyricFormat)combo.SelectedIndex;
             ViewModel.ParseLyricsCommand.Execute(null);
+        }
+    }
+
+    private void UpdateLyricsPreview()
+    {
+        if (LyricsPreviewPanel == null) return;
+
+        LyricsPreviewPanel.Children.Clear();
+
+        if (ViewModel.ParsedLyrics == null || ViewModel.ParsedLyrics.Count == 0)
+        {
+            LyricsPreviewPanel.Children.Add(new TextBlock
+            {
+                Text = "无歌词",
+                Foreground = new SolidColorBrush(Colors.Gray),
+                HorizontalAlignment = HorizontalAlignment.Center,
+                Margin = new Thickness(0, 150, 0, 0),
+                FontSize = 16
+            });
+            return;
+        }
+
+        foreach (var lyric in ViewModel.ParsedLyrics)
+        {
+            var textBlock = new TextBlock
+            {
+                Text = lyric.Text,
+                Foreground = new SolidColorBrush(Colors.Gray),
+                FontSize = 14,
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 4, 0, 4)
+            };
+            LyricsPreviewPanel.Children.Add(textBlock);
         }
     }
 
     private void UpdateLyricsHighlight()
     {
-        // 更新歌词高亮显示
-        if (LyricsPreviewPanel == null || ViewModel.ParsedLyrics == null)
-            return;
+        if (LyricsPreviewPanel == null || ViewModel.ParsedLyrics == null) return;
 
-        for (int i = 0; i < ViewModel.ParsedLyrics.Count; i++)
+        for (int i = 0; i < ViewModel.ParsedLyrics.Count && i < LyricsPreviewPanel.Children.Count; i++)
         {
-            if (i < LyricsPreviewPanel.Children.Count)
+            if (LyricsPreviewPanel.Children[i] is TextBlock textBlock)
             {
-                var textBlock = LyricsPreviewPanel.Children[i] as TextBlock;
-                if (textBlock != null)
+                if (i == ViewModel.CurrentLyricIndex)
                 {
-                    if (i == ViewModel.CurrentLyricIndex)
+                    textBlock.Foreground = new SolidColorBrush(Colors.White);
+                    textBlock.FontWeight = Microsoft.UI.Text.FontWeights.Bold;
+                    textBlock.FontSize = 17;
+                    ScrollToLyric(textBlock);
+                    
+                    // 更新时间显示
+                    if (CurrentLyricTimeText != null && ViewModel.ParsedLyrics[i].Time != null)
                     {
-                        textBlock.Foreground = new SolidColorBrush(Colors.White);
-                        textBlock.FontWeight = Microsoft.UI.Text.FontWeights.Bold;
-                        textBlock.FontSize = 16;
-                        ScrollToLyric(textBlock);
+                        CurrentLyricTimeText.Text = ViewModel.ParsedLyrics[i].Text;
                     }
-                    else
-                    {
-                        textBlock.Foreground = new SolidColorBrush(Colors.Gray);
-                        textBlock.FontWeight = Microsoft.UI.Text.FontWeights.Normal;
-                        textBlock.FontSize = 14;
-                    }
+                }
+                else
+                {
+                    textBlock.Foreground = new SolidColorBrush(Colors.Gray);
+                    textBlock.FontWeight = Microsoft.UI.Text.FontWeights.Normal;
+                    textBlock.FontSize = 14;
                 }
             }
         }
@@ -389,13 +399,13 @@ public sealed partial class CreatorPage : Page
     {
         try
         {
-            if (textBlock == null || LyricsScrollViewer == null)
-                return;
+            if (LyricsScrollViewer == null) return;
 
             var transform = textBlock.TransformToVisual(LyricsScrollViewer);
             var position = transform.TransformPoint(new Windows.Foundation.Point(0, 0));
             var targetOffset = LyricsScrollViewer.VerticalOffset + position.Y - (LyricsScrollViewer.ActualHeight / 2);
             targetOffset = Math.Max(0, targetOffset);
+            
             LyricsScrollViewer.ChangeView(null, targetOffset, null, false);
         }
         catch { }
@@ -410,24 +420,14 @@ public sealed partial class CreatorPage : Page
         ViewModel.TogglePlayPauseCommand.Execute(null);
         
         if (ViewModel.IsPlaying)
-        {
             _playbackTimer.Start();
-        }
         else
-        {
             _playbackTimer.Stop();
-        }
-    }
-
-    private void PlaybackTimer_Tick(object sender, object e)
-    {
-        ViewModel.UpdatePlaybackTime();
-        UpdateLyricsHighlight();
     }
 
     #endregion
 
-    #region UI Helpers
+    #region Helpers
 
     private void ShowInfoBar(string title, string message, InfoBarSeverity severity)
     {
@@ -439,13 +439,39 @@ public sealed partial class CreatorPage : Page
         InfoBar.IsOpen = true;
     }
 
-    private void OnFormChanged(object sender, TextChangedEventArgs e)
+    private async Task<StorageFile> PickFileAsync(string[] extensions, PickerLocationId location)
     {
-        if (ViewModel != null)
-        {
-            ViewModel.IsModified = true;
-        }
+        var picker = new FileOpenPicker();
+        InitializeWithWindow.Initialize(picker, WindowNative.GetWindowHandle(App.MainWindow));
+        picker.SuggestedStartLocation = location;
+        foreach (var ext in extensions)
+            picker.FileTypeFilter.Add(ext);
+        return await picker.PickSingleFileAsync();
+    }
+
+    private async Task<StorageFile> SaveFileAsync((string name, string[] extensions)[] fileTypes, string suggestedFileName)
+    {
+        var picker = new FileSavePicker();
+        InitializeWithWindow.Initialize(picker, WindowNative.GetWindowHandle(App.MainWindow));
+        picker.SuggestedStartLocation = PickerLocationId.DocumentsLibrary;
+        picker.SuggestedFileName = suggestedFileName;
+        foreach (var (name, extensions) in fileTypes)
+            picker.FileTypeChoices.Add(name, extensions.ToList());
+        return await picker.PickSaveFileAsync();
+    }
+
+    private bool IsAudioFile(string extension)
+    {
+        var audioExtensions = new[] { ".mp3", ".flac", ".wav", ".ogg", ".m4a", ".aac" };
+        return audioExtensions.Contains(extension.ToLower());
+    }
+
+    private bool IsImageFile(string extension)
+    {
+        var imageExtensions = new[] { ".jpg", ".jpeg", ".png", ".bmp", ".webp" };
+        return imageExtensions.Contains(extension.ToLower());
     }
 
     #endregion
+    
 }
