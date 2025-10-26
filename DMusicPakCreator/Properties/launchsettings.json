@@ -1,0 +1,10 @@
+﻿{
+    "profiles": {
+      "DMusicPakCreator (Unpackaged)": {
+        "commandName": "Project"
+      },
+      "DMusicPakCreator (Package)": {
+        "commandName": "MsixPackage"
+      }
+    }
+}
