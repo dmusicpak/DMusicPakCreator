@@ -13,6 +13,8 @@ using Microsoft.UI.Xaml.Media;
 using Microsoft.UI;
 using WinRT.Interop;
 using System.Text.RegularExpressions;
+using System.Diagnostics;
+using System.IO;
 
 namespace DMusicPakCreator.Views;
 
@@ -23,6 +25,7 @@ public sealed partial class CreatorPage : Page
     private string _currentFilePath;
     private bool _isModified;
     private byte[] _tempAudioData;
+    private string _tempAudioFileName;
     private byte[] _tempCoverData;
     private CoverFormat _tempCoverFormat;
     private uint _tempCoverWidth;
@@ -31,6 +34,8 @@ public sealed partial class CreatorPage : Page
     private DispatcherTimer _playbackTimer;
     private List<LyricLine> _parsedLyrics;
     private int _currentLyricIndex = -1;
+    private StorageFile _currentTempAudioFile;
+    private StorageFolder _tempFolder; // 缓存临时文件夹引用
 
     public CreatorViewModel ViewModel { get; }
 
@@ -39,9 +44,25 @@ public sealed partial class CreatorPage : Page
         ViewModel = App.GetService<CreatorViewModel>();
         InitializeComponent();
 
+        // 预先获取临时文件夹以避免线程问题
+        try
+        {
+            Debug.WriteLine("尝试获取临时文件夹...");
+            _tempFolder = ApplicationData.Current.TemporaryFolder;
+            Debug.WriteLine($"✅ 临时文件夹已缓存: {_tempFolder.Path}");
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"⚠️ 警告: 无法获取 ApplicationData 临时文件夹: {ex.Message}");
+            Debug.WriteLine($"异常类型: {ex.GetType().Name}");
+            _tempFolder = null;
+        }
+
         _mediaPlayer = new MediaPlayer();
         _mediaPlayer.MediaEnded += MediaPlayer_MediaEnded;
         _mediaPlayer.MediaOpened += MediaPlayer_MediaOpened;
+        _mediaPlayer.MediaFailed += MediaPlayer_MediaFailed;
+        _mediaPlayer.SourceChanged += MediaPlayer_SourceChanged;
 
         _playbackTimer = new DispatcherTimer();
         _playbackTimer.Interval = TimeSpan.FromMilliseconds(100);
@@ -51,6 +72,8 @@ public sealed partial class CreatorPage : Page
 
         UpdateUIState();
         UpdateStatusText("就绪");
+        
+        Debug.WriteLine("========== CreatorPage 初始化完成 ==========");
     }
 
     #region File Operations
@@ -66,7 +89,9 @@ public sealed partial class CreatorPage : Page
             _currentFilePath = null;
             _isModified = false;
             _tempAudioData = null;
+            _tempAudioFileName = null;
             _tempCoverData = null;
+            _currentTempAudioFile = null;
 
             ClearForm();
             UpdateUIState();
@@ -168,7 +193,7 @@ public sealed partial class CreatorPage : Page
             {
                 var audio = new Audio
                 {
-                    SourceFilename = AudioFileNameText.Text,
+                    SourceFilename = _tempAudioFileName ?? "audio.mp3",
                     Data = _tempAudioData
                 };
                 _currentPackage.SetAudio(audio);
@@ -318,6 +343,7 @@ public sealed partial class CreatorPage : Page
                 reader.ReadBytes(_tempAudioData);
             }
 
+            _tempAudioFileName = file.Name;
             _isModified = true;
 
             // 更新UI
@@ -326,6 +352,7 @@ public sealed partial class CreatorPage : Page
             AudioEmptyState.Visibility = Visibility.Collapsed;
             AudioInfoState.Visibility = Visibility.Visible;
             ImportAudioButton.Visibility = Visibility.Collapsed;
+            ChangeAudioButton.Visibility = Visibility.Visible;
 
             // 自动识别和填充元数据
             await AutoFillMetadata(file);
@@ -379,6 +406,7 @@ public sealed partial class CreatorPage : Page
     {
         try
         {
+            _currentTempAudioFile = file;
             var stream = await file.OpenAsync(FileAccessMode.Read);
             _mediaPlayer.Source = MediaSource.CreateFromStream(stream, file.ContentType);
             PlayPauseButton.IsEnabled = true;
@@ -389,27 +417,188 @@ public sealed partial class CreatorPage : Page
         }
     }
 
+    private async Task LoadAudioForPlaybackFromData()
+    {
+        try
+        {
+            Debug.WriteLine("========== LoadAudioForPlaybackFromData 开始 ==========");
+            
+            if (_tempAudioData == null || _tempAudioData.Length == 0)
+            {
+                Debug.WriteLine("错误: 没有音频数据");
+                ShowInfoBar("错误", "没有音频数据", InfoBarSeverity.Warning);
+                PlayPauseButton.IsEnabled = false;
+                return;
+            }
+
+            Debug.WriteLine($"音频数据大小: {_tempAudioData.Length} 字节 ({FormatFileSize(_tempAudioData.Length)})");
+            Debug.WriteLine($"音频文件名: {_tempAudioFileName}");
+            UpdateStatusText("正在加载音频用于播放...");
+
+            var fileName = _tempAudioFileName ?? "temp_audio.mp3";
+            Debug.WriteLine($"原始文件名: {fileName}");
+            
+            // 确保文件名有效
+            fileName = string.Join("_", fileName.Split(Path.GetInvalidFileNameChars()));
+            Debug.WriteLine($"处理后文件名: {fileName}");
+            
+            StorageFile tempFile;
+            
+            // 方案A: 使用缓存的 ApplicationData 临时文件夹
+            if (_tempFolder != null)
+            {
+                Debug.WriteLine($"✅ 使用 ApplicationData 临时文件夹: {_tempFolder.Path}");
+                tempFile = await _tempFolder.CreateFileAsync(
+                    fileName,
+                    CreationCollisionOption.ReplaceExisting);
+            }
+            else
+            {
+                // 方案B: 使用系统临时文件夹
+                Debug.WriteLine("⚠️ ApplicationData 不可用，使用系统临时文件夹");
+                var systemTempPath = Path.GetTempPath();
+                Debug.WriteLine($"系统临时文件夹: {systemTempPath}");
+                
+                var fullPath = Path.Combine(systemTempPath, fileName);
+                Debug.WriteLine($"完整路径: {fullPath}");
+                
+                // 直接写入文件
+                await Task.Run(() => File.WriteAllBytes(fullPath, _tempAudioData));
+                Debug.WriteLine("音频数据已写入系统临时文件");
+                
+                // 从路径创建 StorageFile
+                tempFile = await StorageFile.GetFileFromPathAsync(fullPath);
+            }
+            
+            Debug.WriteLine($"临时文件已创建: {tempFile.Path}");
+            
+            // 如果使用 ApplicationData 方式，需要写入数据
+            if (_tempFolder != null)
+            {
+                await FileIO.WriteBytesAsync(tempFile, _tempAudioData);
+                Debug.WriteLine("音频数据已写入临时文件");
+            }
+
+            _currentTempAudioFile = tempFile;
+
+            // 重新打开文件以获取stream
+            var stream = await tempFile.OpenReadAsync();
+            Debug.WriteLine($"文件流已打开，大小: {stream.Size} 字节");
+            
+            // 根据文件扩展名获取正确的content type
+            var contentType = GetContentType(fileName);
+            Debug.WriteLine($"Content Type: {contentType}");
+            
+            // 检查MediaPlayer状态
+            Debug.WriteLine($"MediaPlayer 状态: {(_mediaPlayer != null ? "已初始化" : "未初始化")}");
+            
+            // 设置MediaPlayer的源 - 必须在UI线程上执行
+            await DispatcherQueue.EnqueueAsync(() =>
+            {
+                var mediaSource = MediaSource.CreateFromStream(stream, contentType);
+                Debug.WriteLine("MediaSource 已创建");
+                
+                _mediaPlayer.Source = mediaSource;
+                Debug.WriteLine("MediaPlayer.Source 已设置");
+                
+                PlayPauseButton.IsEnabled = true;
+                Debug.WriteLine("播放按钮已启用");
+            });
+            
+            ShowInfoBar("成功", $"音频已加载，可以播放", InfoBarSeverity.Success);
+            UpdateStatusText($"已加载: {Path.GetFileName(_currentFilePath ?? fileName)}");
+            
+            Debug.WriteLine("========== LoadAudioForPlaybackFromData 完成 ==========");
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine("========== LoadAudioForPlaybackFromData 发生异常 ==========");
+            Debug.WriteLine($"异常类型: {ex.GetType().Name}");
+            Debug.WriteLine($"异常消息: {ex.Message}");
+            Debug.WriteLine($"堆栈跟踪:\n{ex.StackTrace}");
+            Debug.WriteLine("========================================");
+            
+            UpdateStatusText("音频加载失败");
+            ShowInfoBar("音频加载失败", $"错误: {ex.Message}", InfoBarSeverity.Error);
+            
+            await DispatcherQueue.EnqueueAsync(() =>
+            {
+                PlayPauseButton.IsEnabled = false;
+            });
+        }
+    }
+
+    private string GetContentType(string filename)
+    {
+        if (string.IsNullOrEmpty(filename))
+            return "audio/mpeg";
+
+        var ext = Path.GetExtension(filename).ToLower();
+        return ext switch
+        {
+            ".mp3" => "audio/mpeg",
+            ".flac" => "audio/flac",
+            ".wav" => "audio/wav",
+            ".ogg" => "audio/ogg",
+            ".m4a" => "audio/mp4",
+            ".aac" => "audio/aac",
+            _ => "audio/mpeg"
+        };
+    }
+
     private void PlayPauseButton_Click(object sender, RoutedEventArgs e)
     {
-        if (_isPlaying)
+        try
         {
-            _mediaPlayer.Pause();
-            _isPlaying = false;
-            PlayPauseIcon.Glyph = "\uE768"; // Play
-            _playbackTimer.Stop();
+            Debug.WriteLine("========== PlayPauseButton_Click ==========");
+            Debug.WriteLine($"按钮状态 - IsEnabled: {PlayPauseButton.IsEnabled}");
+            Debug.WriteLine($"MediaPlayer: {(_mediaPlayer != null ? "已初始化" : "null")}");
+            Debug.WriteLine($"PlaybackSession: {(_mediaPlayer?.PlaybackSession != null ? "存在" : "null")}");
+            Debug.WriteLine($"当前播放状态: {(_isPlaying ? "播放中" : "已暂停")}");
+            
+            if (_mediaPlayer?.PlaybackSession == null)
+            {
+                Debug.WriteLine("错误: MediaPlayer 或 PlaybackSession 为 null");
+                ShowInfoBar("播放错误", "媒体播放器未就绪", InfoBarSeverity.Error);
+                return;
+            }
+
+            if (_isPlaying)
+            {
+                Debug.WriteLine("执行: 暂停播放");
+                _mediaPlayer.Pause();
+                _isPlaying = false;
+                PlayPauseIcon.Glyph = "\uE768"; // Play
+                _playbackTimer.Stop();
+                Debug.WriteLine("已暂停");
+            }
+            else
+            {
+                Debug.WriteLine("执行: 开始播放");
+                _mediaPlayer.Play();
+                _isPlaying = true;
+                PlayPauseIcon.Glyph = "\uE769"; // Pause
+                _playbackTimer.Start();
+                Debug.WriteLine("已开始播放");
+            }
+            
+            Debug.WriteLine("==========================================");
         }
-        else
+        catch (Exception ex)
         {
-            _mediaPlayer.Play();
-            _isPlaying = true;
-            PlayPauseIcon.Glyph = "\uE769"; // Pause
-            _playbackTimer.Start();
+            Debug.WriteLine("========== PlayPauseButton_Click 异常 ==========");
+            Debug.WriteLine($"异常类型: {ex.GetType().Name}");
+            Debug.WriteLine($"异常消息: {ex.Message}");
+            Debug.WriteLine($"堆栈跟踪:\n{ex.StackTrace}");
+            Debug.WriteLine("===============================================");
+            
+            ShowInfoBar("播放错误", ex.Message, InfoBarSeverity.Error);
         }
     }
 
     private void MediaPlayer_MediaEnded(MediaPlayer sender, object args)
     {
-        DispatcherQueue.TryEnqueue(() =>
+        DispatcherQueue?.TryEnqueue(() =>
         {
             _isPlaying = false;
             PlayPauseIcon.Glyph = "\uE768";
@@ -422,22 +611,55 @@ public sealed partial class CreatorPage : Page
 
     private void MediaPlayer_MediaOpened(MediaPlayer sender, object args)
     {
-        DispatcherQueue.TryEnqueue(() =>
+        DispatcherQueue?.TryEnqueue(() =>
         {
+            Debug.WriteLine("========== MediaPlayer_MediaOpened ==========");
+            Debug.WriteLine($"媒体已打开，时长: {sender.NaturalDuration}");
             TimeDisplay.Text = "00:00 / " + FormatTime(sender.NaturalDuration);
+            Debug.WriteLine($"PlaybackSession 状态: {sender.PlaybackSession?.PlaybackState}");
+            Debug.WriteLine("===========================================");
         });
+    }
+
+    private void MediaPlayer_MediaFailed(MediaPlayer sender, MediaPlayerFailedEventArgs args)
+    {
+        DispatcherQueue?.TryEnqueue(() =>
+        {
+            Debug.WriteLine("========== MediaPlayer_MediaFailed ==========");
+            Debug.WriteLine($"错误代码: {args.Error}");
+            Debug.WriteLine($"错误消息: {args.ErrorMessage}");
+            Debug.WriteLine($"扩展错误代码: {args.ExtendedErrorCode}");
+            Debug.WriteLine("============================================");
+            
+            ShowInfoBar("媒体加载失败", $"错误: {args.ErrorMessage}", InfoBarSeverity.Error);
+            PlayPauseButton.IsEnabled = false;
+        });
+    }
+
+    private void MediaPlayer_SourceChanged(MediaPlayer sender, object args)
+    {
+        Debug.WriteLine("========== MediaPlayer_SourceChanged ==========");
+        Debug.WriteLine($"新的源: {(sender.Source != null ? "已设置" : "null")}");
+        Debug.WriteLine("==============================================");
     }
 
     private void PlaybackTimer_Tick(object sender, object e)
     {
-        if (_mediaPlayer.PlaybackSession != null)
+        try
         {
-            var current = _mediaPlayer.PlaybackSession.Position;
-            var total = _mediaPlayer.NaturalDuration;
-            TimeDisplay.Text = FormatTime(current) + " / " + FormatTime(total);
-            
-            // 更新歌词显示
-            UpdateCurrentLyric(current);
+            if (_mediaPlayer?.PlaybackSession != null)
+            {
+                var current = _mediaPlayer.PlaybackSession.Position;
+                var total = _mediaPlayer.NaturalDuration;
+                TimeDisplay.Text = FormatTime(current) + " / " + FormatTime(total);
+                
+                // 更新歌词显示
+                UpdateCurrentLyric(current);
+            }
+        }
+        catch
+        {
+            // 静默处理定时器错误
         }
     }
 
@@ -539,7 +761,7 @@ public sealed partial class CreatorPage : Page
             CoverImage.Source = bitmap;
             CoverImage.Visibility = Visibility.Visible;
             CoverEmptyState.Visibility = Visibility.Collapsed;
-            CoverInfoText.Text = $"{props.Width} × {props.Height} • {_tempCoverFormat} • {FormatFileSize(_tempCoverData.Length)}";
+            CoverInfoText.Text = $"{props.Width}×{props.Height} • {FormatFileSize(_tempCoverData.Length)}";
             RemoveCoverButton.IsEnabled = true;
 
             UpdateUIState();
@@ -627,7 +849,7 @@ public sealed partial class CreatorPage : Page
     {
         LyricsBox.Text = string.Empty;
         LyricsFormatCombo.SelectedIndex = 0;
-        _parsedLyrics.Clear();
+        _parsedLyrics?.Clear();
         UpdateLyricsPreview();
     }
 
@@ -638,142 +860,189 @@ public sealed partial class CreatorPage : Page
 
     private void ParseAndDisplayLyrics()
     {
-        _parsedLyrics = new List<LyricLine>();
-        _parsedLyrics.Clear();
-        _currentLyricIndex = -1;
-
-        if (LyricsBox != null && string.IsNullOrWhiteSpace(LyricsBox.Text))
+        try
         {
+            if (_parsedLyrics == null)
+                _parsedLyrics = new List<LyricLine>();
+
+            _parsedLyrics.Clear();
+            _currentLyricIndex = -1;
+
+            if (string.IsNullOrWhiteSpace(LyricsBox?.Text))
+            {
+                UpdateLyricsPreview();
+                return;
+            }
+
+            int format = LyricsFormatCombo?.SelectedIndex ?? 0;
+            
+            // 解析LRC格式 (索引1-3都是LRC)
+            if (format >= 1 && format <= 3)
+            {
+                ParseLrcLyrics(LyricsBox.Text);
+            }
+            
             UpdateLyricsPreview();
-            return;
         }
-
-        int format = LyricsFormatCombo.SelectedIndex;
-        
-        // 解析LRC格式 (索引1-3都是LRC)
-        if (format >= 1 && format <= 3)
+        catch
         {
-            ParseLrcLyrics(LyricsBox.Text);
+            // 静默处理解析错误
         }
-        
-        UpdateLyricsPreview();
     }
 
     private void ParseLrcLyrics(string lrcText)
     {
-        // LRC 格式: [mm:ss.xx]歌词文本
-        var regex = new Regex(@"\[(\d{2}):(\d{2})\.(\d{2})\](.*)");
-        var lines = lrcText.Split('\n');
-
-        foreach (var line in lines)
+        try
         {
-            var match = regex.Match(line.Trim());
-            if (match.Success)
+            if (string.IsNullOrEmpty(lrcText))
+                return;
+
+            // LRC 格式: [mm:ss.xx]歌词文本
+            var regex = new Regex(@"\[(\d{2}):(\d{2})\.(\d{2})\](.*)");
+            var lines = lrcText.Split('\n');
+
+            foreach (var line in lines)
             {
-                int minutes = int.Parse(match.Groups[1].Value);
-                int seconds = int.Parse(match.Groups[2].Value);
-                int centiseconds = int.Parse(match.Groups[3].Value);
-                string text = match.Groups[4].Value.Trim();
-
-                var time = new TimeSpan(0, 0, minutes, seconds, centiseconds * 10);
-                _parsedLyrics.Add(new LyricLine
+                var match = regex.Match(line.Trim());
+                if (match.Success)
                 {
-                    Time = time,
-                    Text = text
-                });
-            }
-        }
+                    int minutes = int.Parse(match.Groups[1].Value);
+                    int seconds = int.Parse(match.Groups[2].Value);
+                    int centiseconds = int.Parse(match.Groups[3].Value);
+                    string text = match.Groups[4].Value.Trim();
 
-        // 按时间排序
-        _parsedLyrics = _parsedLyrics.OrderBy(l => l.Time).ToList();
+                    var time = new TimeSpan(0, 0, minutes, seconds, centiseconds * 10);
+                    _parsedLyrics.Add(new LyricLine
+                    {
+                        Time = time,
+                        Text = text
+                    });
+                }
+            }
+
+            // 按时间排序
+            _parsedLyrics = _parsedLyrics.OrderBy(l => l.Time).ToList();
+        }
+        catch
+        {
+            // 静默处理解析错误
+        }
     }
 
     private void UpdateLyricsPreview()
     {
-        if (LyricsPreviewPanel == null) return;
-        LyricsPreviewPanel.Children.Clear();
-
-        if (_parsedLyrics.Count == 0)
+        try
         {
-            var emptyText = new TextBlock
+            if (LyricsPreviewPanel == null)
+                return;
+
+            LyricsPreviewPanel.Children.Clear();
+
+            if (_parsedLyrics == null || _parsedLyrics.Count == 0)
             {
-                Text = "无歌词",
-                Foreground = new SolidColorBrush(Colors.Gray),
-                HorizontalAlignment = HorizontalAlignment.Center,
-                Margin = new Thickness(0, 200, 0, 0)
-            };
-            LyricsPreviewPanel.Children.Add(emptyText);
-            return;
+                var emptyText = new TextBlock
+                {
+                    Text = "无歌词",
+                    Foreground = new SolidColorBrush(Colors.Gray),
+                    HorizontalAlignment = HorizontalAlignment.Center,
+                    Margin = new Thickness(0, 150, 0, 0)
+                };
+                LyricsPreviewPanel.Children.Add(emptyText);
+                return;
+            }
+
+            foreach (var lyric in _parsedLyrics)
+            {
+                var textBlock = new TextBlock
+                {
+                    Text = lyric.Text,
+                    FontSize = 14,
+                    TextWrapping = TextWrapping.Wrap,
+                    Foreground = new SolidColorBrush(Colors.Gray),
+                    Margin = new Thickness(0, 4, 0, 4)
+                };
+                lyric.TextBlock = textBlock;
+                LyricsPreviewPanel.Children.Add(textBlock);
+            }
         }
-
-        foreach (var lyric in _parsedLyrics)
+        catch
         {
-            var textBlock = new TextBlock
-            {
-                Text = lyric.Text,
-                FontSize = 14,
-                TextWrapping = TextWrapping.Wrap,
-                Foreground = new SolidColorBrush(Colors.Gray),
-                Margin = new Thickness(0, 4, 0, 4)
-            };
-            lyric.TextBlock = textBlock;
-            LyricsPreviewPanel.Children.Add(textBlock);
+            // 静默处理UI更新错误
         }
     }
 
     private void UpdateCurrentLyric(TimeSpan currentTime)
     {
-        if (_parsedLyrics.Count == 0) return;
-
-        // 找到当前应该显示的歌词
-        int newIndex = -1;
-        for (int i = 0; i < _parsedLyrics.Count; i++)
+        try
         {
-            if (_parsedLyrics[i].Time <= currentTime)
+            if (_parsedLyrics == null || _parsedLyrics.Count == 0)
+                return;
+
+            // 找到当前应该显示的歌词
+            int newIndex = -1;
+            for (int i = 0; i < _parsedLyrics.Count; i++)
             {
-                newIndex = i;
+                if (_parsedLyrics[i].Time <= currentTime)
+                {
+                    newIndex = i;
+                }
+                else
+                {
+                    break;
+                }
             }
-            else
+
+            if (newIndex != _currentLyricIndex)
             {
-                break;
+                _currentLyricIndex = newIndex;
+                UpdateLyricsHighlight();
             }
         }
-
-        if (newIndex != _currentLyricIndex)
+        catch
         {
-            _currentLyricIndex = newIndex;
-            UpdateLyricsHighlight();
+            // 静默处理歌词更新错误
         }
     }
 
     private void UpdateLyricsHighlight()
     {
-        for (int i = 0; i < _parsedLyrics.Count; i++)
+        try
         {
-            var lyric = _parsedLyrics[i];
-            if (lyric.TextBlock != null)
+            if (_parsedLyrics == null)
+                return;
+
+            for (int i = 0; i < _parsedLyrics.Count; i++)
             {
-                if (i == _currentLyricIndex)
+                var lyric = _parsedLyrics[i];
+                if (lyric?.TextBlock != null)
                 {
-                    // 高亮当前歌词
-                    lyric.TextBlock.Foreground = new SolidColorBrush(Colors.White);
-                    lyric.TextBlock.FontWeight = Microsoft.UI.Text.FontWeights.Bold;
-                    lyric.TextBlock.FontSize = 16;
-                    
-                    // 更新时间显示
-                    CurrentLyricTimeText.Text = FormatTime(lyric.Time);
-                    
-                    // 滚动到当前歌词
-                    ScrollToLyric(lyric.TextBlock);
-                }
-                else
-                {
-                    // 其他歌词变暗
-                    lyric.TextBlock.Foreground = new SolidColorBrush(Colors.Gray);
-                    lyric.TextBlock.FontWeight = Microsoft.UI.Text.FontWeights.Normal;
-                    lyric.TextBlock.FontSize = 14;
+                    if (i == _currentLyricIndex)
+                    {
+                        // 高亮当前歌词
+                        lyric.TextBlock.Foreground = new SolidColorBrush(Colors.White);
+                        lyric.TextBlock.FontWeight = Microsoft.UI.Text.FontWeights.Bold;
+                        lyric.TextBlock.FontSize = 16;
+                        
+                        // 更新时间显示
+                        if (CurrentLyricTimeText != null)
+                            CurrentLyricTimeText.Text = FormatTime(lyric.Time);
+                        
+                        // 滚动到当前歌词
+                        ScrollToLyric(lyric.TextBlock);
+                    }
+                    else
+                    {
+                        // 其他歌词变暗
+                        lyric.TextBlock.Foreground = new SolidColorBrush(Colors.Gray);
+                        lyric.TextBlock.FontWeight = Microsoft.UI.Text.FontWeights.Normal;
+                        lyric.TextBlock.FontSize = 14;
+                    }
                 }
             }
+        }
+        catch
+        {
+            // 静默处理高亮错误
         }
     }
 
@@ -781,6 +1050,9 @@ public sealed partial class CreatorPage : Page
     {
         try
         {
+            if (textBlock == null || LyricsScrollViewer == null)
+                return;
+
             var transform = textBlock.TransformToVisual(LyricsScrollViewer);
             var position = transform.TransformPoint(new Windows.Foundation.Point(0, 0));
             
@@ -804,53 +1076,99 @@ public sealed partial class CreatorPage : Page
     {
         try
         {
+            Debug.WriteLine("========== LoadPackageData 开始 ==========");
+            
+            if (_currentPackage == null)
+            {
+                Debug.WriteLine("错误: _currentPackage 为 null");
+                return;
+            }
+
+            Debug.WriteLine("正在加载包数据...");
+
             // 加载元数据
             var metadata = _currentPackage.GetMetadata();
-            TitleBox.Text = metadata.Title;
-            ArtistBox.Text = metadata.Artist;
-            AlbumBox.Text = metadata.Album;
-            GenreBox.Text = metadata.Genre;
-            YearBox.Text = metadata.Year;
-            CommentBox.Text = metadata.Comment;
-            DurationBox.Text = metadata.DurationMs.ToString();
-            BitrateBox.Text = metadata.Bitrate.ToString();
-            SampleRateBox.Text = metadata.SampleRate.ToString();
-            ChannelsBox.Text = metadata.Channels.ToString();
+            Debug.WriteLine($"元数据获取: {(metadata != null ? "成功" : "失败")}");
+            
+            if (metadata != null)
+            {
+                TitleBox.Text = metadata.Title ?? string.Empty;
+                ArtistBox.Text = metadata.Artist ?? string.Empty;
+                AlbumBox.Text = metadata.Album ?? string.Empty;
+                GenreBox.Text = metadata.Genre ?? string.Empty;
+                YearBox.Text = metadata.Year ?? string.Empty;
+                CommentBox.Text = metadata.Comment ?? string.Empty;
+                DurationBox.Text = metadata.DurationMs.ToString();
+                BitrateBox.Text = metadata.Bitrate.ToString();
+                SampleRateBox.Text = metadata.SampleRate.ToString();
+                ChannelsBox.Text = metadata.Channels.ToString();
+                Debug.WriteLine($"元数据已加载: 标题={metadata.Title}, 艺术家={metadata.Artist}");
+            }
 
             // 加载音频
+            Debug.WriteLine("正在获取音频数据...");
             var audio = _currentPackage.GetAudio();
+            Debug.WriteLine($"GetAudio() 返回: {(audio != null ? "非null" : "null")}");
+            
+            if (audio != null)
+            {
+                Debug.WriteLine($"音频对象 - Data: {(audio.Data != null ? $"{audio.Data.Length}字节" : "null")}, SourceFilename: {audio.SourceFilename}");
+            }
+            
             if (audio?.Data != null && audio.Data.Length > 0)
             {
-                AudioFileNameText.Text = audio.SourceFilename;
-                AudioSizeText.Text = FormatFileSize(audio.Data.Length);
+                Debug.WriteLine($"开始处理音频: {audio.Data.Length} 字节, 文件名: {audio.SourceFilename}");
+                
+                _tempAudioData = audio.Data;
+                _tempAudioFileName = audio.SourceFilename ?? "audio.mp3";
+                
+                Debug.WriteLine($"_tempAudioData 已设置: {_tempAudioData.Length} 字节");
+                Debug.WriteLine($"_tempAudioFileName 已设置: {_tempAudioFileName}");
+                
+                AudioFileNameText.Text = _tempAudioFileName;
+                AudioSizeText.Text = FormatFileSize(_tempAudioData.Length);
                 AudioEmptyState.Visibility = Visibility.Collapsed;
                 AudioInfoState.Visibility = Visibility.Visible;
                 ImportAudioButton.Visibility = Visibility.Collapsed;
-                _tempAudioData = audio.Data;
+                ChangeAudioButton.Visibility = Visibility.Visible;
 
-                try
-                {
-                    var tempFile = await CreateTempAudioFile(audio);
-                    await LoadAudioForPlayback(tempFile);
-                }
-                catch
-                {
-                }
+                Debug.WriteLine("UI已更新，准备加载音频用于播放...");
+                
+                // 加载音频用于播放 - 添加延迟确保UI已更新
+                await Task.Delay(100);
+                Debug.WriteLine("延迟100ms后，调用 LoadAudioForPlaybackFromData()");
+                await LoadAudioForPlaybackFromData();
+            }
+            else
+            {
+                // 没有音频数据
+                Debug.WriteLine("警告: 包中没有音频数据或音频数据为空");
+                ShowInfoBar("提示", "包中没有音频数据", InfoBarSeverity.Warning);
+                PlayPauseButton.IsEnabled = false;
             }
 
             // 加载歌词
+            Debug.WriteLine("正在加载歌词...");
             var lyrics = _currentPackage.GetLyrics();
             if (lyrics?.Data != null && lyrics.Data.Length > 0)
             {
-                LyricsBox.Text = lyrics.Text;
+                Debug.WriteLine($"歌词数据: {lyrics.Data.Length} 字节, 格式: {lyrics.Format}");
+                LyricsBox.Text = lyrics.Text ?? string.Empty;
                 LyricsFormatCombo.SelectedIndex = (int)lyrics.Format;
                 ParseAndDisplayLyrics();
             }
+            else
+            {
+                Debug.WriteLine("包中没有歌词数据");
+            }
 
             // 加载封面
+            Debug.WriteLine("正在加载封面...");
             var cover = _currentPackage.GetCover();
             if (cover?.Data != null && cover.Data.Length > 0)
             {
+                Debug.WriteLine($"封面数据: {cover.Data.Length} 字节, 格式: {cover.Format}, 尺寸: {cover.Width}×{cover.Height}");
+                
                 _tempCoverData = cover.Data;
                 _tempCoverFormat = cover.Format;
                 _tempCoverWidth = cover.Width;
@@ -866,24 +1184,27 @@ public sealed partial class CreatorPage : Page
                 CoverImage.Source = bitmap;
                 CoverImage.Visibility = Visibility.Visible;
                 CoverEmptyState.Visibility = Visibility.Collapsed;
-                CoverInfoText.Text = $"{cover.Width} × {cover.Height} • {cover.Format} • {FormatFileSize(cover.Data.Length)}";
+                CoverInfoText.Text = $"{cover.Width}×{cover.Height} • {FormatFileSize(cover.Data.Length)}";
                 RemoveCoverButton.IsEnabled = true;
+                Debug.WriteLine("封面已加载并显示");
             }
+            else
+            {
+                Debug.WriteLine("包中没有封面数据");
+            }
+            
+            Debug.WriteLine("========== LoadPackageData 完成 ==========");
         }
         catch (Exception ex)
         {
+            Debug.WriteLine("========== LoadPackageData 发生异常 ==========");
+            Debug.WriteLine($"异常类型: {ex.GetType().Name}");
+            Debug.WriteLine($"异常消息: {ex.Message}");
+            Debug.WriteLine($"堆栈跟踪:\n{ex.StackTrace}");
+            Debug.WriteLine("========================================");
+            
             ShowInfoBar("加载数据失败", ex.Message, InfoBarSeverity.Error);
         }
-    }
-
-    private async Task<StorageFile> CreateTempAudioFile(Audio audio)
-    {
-        var tempFolder = ApplicationData.Current.TemporaryFolder;
-        var tempFile = await tempFolder.CreateFileAsync(
-            audio.SourceFilename,
-            CreationCollisionOption.ReplaceExisting);
-        await FileIO.WriteBytesAsync(tempFile, audio.Data);
-        return tempFile;
     }
 
     private void SaveFormData()
@@ -895,31 +1216,31 @@ public sealed partial class CreatorPage : Page
             // 保存元数据
             var metadata = new Metadata
             {
-                Title = TitleBox.Text,
-                Artist = ArtistBox.Text,
-                Album = AlbumBox.Text,
-                Genre = GenreBox.Text,
-                Year = YearBox.Text,
-                Comment = CommentBox.Text
+                Title = TitleBox?.Text ?? string.Empty,
+                Artist = ArtistBox?.Text ?? string.Empty,
+                Album = AlbumBox?.Text ?? string.Empty,
+                Genre = GenreBox?.Text ?? string.Empty,
+                Year = YearBox?.Text ?? string.Empty,
+                Comment = CommentBox?.Text ?? string.Empty
             };
 
-            if (uint.TryParse(DurationBox.Text, out uint duration))
+            if (uint.TryParse(DurationBox?.Text, out uint duration))
                 metadata.DurationMs = duration;
-            if (uint.TryParse(BitrateBox.Text, out uint bitrate))
+            if (uint.TryParse(BitrateBox?.Text, out uint bitrate))
                 metadata.Bitrate = bitrate;
-            if (uint.TryParse(SampleRateBox.Text, out uint sampleRate))
+            if (uint.TryParse(SampleRateBox?.Text, out uint sampleRate))
                 metadata.SampleRate = sampleRate;
-            if (ushort.TryParse(ChannelsBox.Text, out ushort channels))
+            if (ushort.TryParse(ChannelsBox?.Text, out ushort channels))
                 metadata.Channels = channels;
 
             _currentPackage.SetMetadata(metadata);
 
             // 保存歌词
-            if (!string.IsNullOrWhiteSpace(LyricsBox.Text))
+            if (!string.IsNullOrWhiteSpace(LyricsBox?.Text))
             {
                 var lyrics = new Lyrics
                 {
-                    Format = (LyricFormat)LyricsFormatCombo.SelectedIndex,
+                    Format = (LyricFormat)(LyricsFormatCombo?.SelectedIndex ?? 0),
                     Data = System.Text.Encoding.UTF8.GetBytes(LyricsBox.Text)
                 };
                 _currentPackage.SetLyrics(lyrics);
@@ -950,6 +1271,7 @@ public sealed partial class CreatorPage : Page
         AudioEmptyState.Visibility = Visibility.Visible;
         AudioInfoState.Visibility = Visibility.Collapsed;
         ImportAudioButton.Visibility = Visibility.Visible;
+        ChangeAudioButton.Visibility = Visibility.Collapsed;
 
         CoverImage.Source = null;
         CoverImage.Visibility = Visibility.Collapsed;
@@ -958,7 +1280,7 @@ public sealed partial class CreatorPage : Page
         RemoveCoverButton.IsEnabled = false;
 
         LyricsFormatCombo.SelectedIndex = 0;
-        _parsedLyrics.Clear();
+        _parsedLyrics?.Clear();
         UpdateLyricsPreview();
 
         PlayPauseButton.IsEnabled = false;
@@ -1006,16 +1328,27 @@ public sealed partial class CreatorPage : Page
             title += " *";
         }
 
-        App.GetService<ShellViewModel>().SetTitle(title);
+        try
+        {
+            App.GetService<ShellViewModel>()?.SetTitle(title);
+        }
+        catch
+        {
+            // 静默处理标题更新错误
+        }
     }
 
     private void UpdateStatusText(string text)
     {
-        StatusText.Text = text;
+        if (StatusText != null)
+            StatusText.Text = text ?? "就绪";
     }
 
     private void ShowInfoBar(string title, string message, InfoBarSeverity severity)
     {
+        if (InfoBar == null)
+            return;
+
         InfoBar.Title = title;
         InfoBar.Message = message;
         InfoBar.Severity = severity;
@@ -1052,17 +1385,56 @@ public sealed partial class CreatorPage : Page
             args.Handled = true;
             if (await PromptSaveChanges())
             {
-                _mediaPlayer?.Dispose();
-                _currentPackage?.Dispose();
-                _playbackTimer?.Stop();
+                CleanupResources();
                 Application.Current.Exit();
             }
         }
         else
         {
+            CleanupResources();
+        }
+    }
+
+    private void CleanupResources()
+    {
+        try
+        {
+            _playbackTimer?.Stop();
             _mediaPlayer?.Dispose();
             _currentPackage?.Dispose();
-            _playbackTimer?.Stop();
         }
+        catch
+        {
+            // 静默处理清理错误
+        }
+    }
+}
+
+// DispatcherQueue 扩展方法
+public static class DispatcherQueueExtensions
+{
+    public static async Task EnqueueAsync(this Microsoft.UI.Dispatching.DispatcherQueue dispatcher, Action action)
+    {
+        var tcs = new TaskCompletionSource<bool>();
+        
+        bool enqueued = dispatcher.TryEnqueue(() =>
+        {
+            try
+            {
+                action();
+                tcs.SetResult(true);
+            }
+            catch (Exception ex)
+            {
+                tcs.SetException(ex);
+            }
+        });
+        
+        if (!enqueued)
+        {
+            tcs.SetException(new InvalidOperationException("无法将操作加入队列"));
+        }
+        
+        await tcs.Task;
     }
 }
