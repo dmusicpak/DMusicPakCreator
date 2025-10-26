@@ -64,6 +64,12 @@ public partial class App : Application
             services.AddSingleton<IActivationService, ActivationService>();
             services.AddSingleton<IPageService, PageService>();
             services.AddSingleton<INavigationService, NavigationService>();
+            
+            services.AddSingleton<PackageService>();
+            services.AddSingleton<AudioService>();
+            services.AddSingleton<CoverService>();
+            services.AddSingleton<LyricsService>();
+            services.AddSingleton<MediaPlayerService>();
 
             // Core Services
             services.AddSingleton<IFileService, FileService>();
